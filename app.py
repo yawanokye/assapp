@@ -3,23 +3,23 @@ import re
 import json
 import time
 import uuid
-import shutil
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 import streamlit as st
 from pptx import Presentation
-from PIL import Image, ImageDraw, ImageFont
 
 import numpy as np
+import cv2
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 
 # =========================
-# App settings
+# Config
 # =========================
-APP_TITLE = "Presentation Assessment Platform (Cloud-Safe MVP)"
-MAX_PRESENTATION_SECONDS = 10 * 60
+APP_TITLE = "Presentation Assessment (Streamlit MVP: PPTX + Video)"
+MAX_VIDEO_SECONDS = 10 * 60
 MAX_QA_SECONDS = 5 * 60
 
 BASE_DIR = "data_sessions"
@@ -27,11 +27,11 @@ os.makedirs(BASE_DIR, exist_ok=True)
 
 
 # =========================
-# Utilities
+# Helpers
 # =========================
 def safe_filename(name: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9._-]+", "_", (name or "").strip())
-    return name[:120] if name else "upload.pptx"
+    return name[:140] if name else "upload.bin"
 
 
 def ensure_session_id() -> str:
@@ -45,7 +45,6 @@ def session_paths(session_id: str) -> Dict[str, str]:
     return {
         "root": root,
         "uploads": os.path.join(root, "uploads"),
-        "snapshots": os.path.join(root, "snapshots"),
         "answers": os.path.join(root, "answers"),
         "meta": os.path.join(root, "meta"),
     }
@@ -57,30 +56,26 @@ def init_dirs(paths: Dict[str, str]):
 
 
 def extract_slide_text(pptx_path: str) -> List[Dict]:
-    """
-    Extract a clean, slide-by-slide text structure.
-    Works on Streamlit Cloud without extra binaries.
-    """
     prs = Presentation(pptx_path)
     slides_out = []
 
     for idx, slide in enumerate(prs.slides, start=1):
-        raw_blocks = []
+        blocks = []
         for shape in slide.shapes:
-            if not hasattr(shape, "text_frame"):
-                continue
-            txt = (shape.text or "").strip()
-            if txt:
-                raw_blocks.append(txt)
+            if hasattr(shape, "text_frame"):
+                txt = (shape.text or "").strip()
+                if txt:
+                    blocks.append(txt)
 
         title = ""
         bullets = []
-        if raw_blocks:
-            first_lines = [ln.strip() for ln in raw_blocks[0].splitlines() if ln.strip()]
+
+        if blocks:
+            first_lines = [ln.strip() for ln in blocks[0].splitlines() if ln.strip()]
             if first_lines:
                 title = first_lines[0]
 
-        for block in raw_blocks:
+        for block in blocks:
             for ln in block.splitlines():
                 ln2 = ln.strip()
                 if not ln2:
@@ -106,10 +101,6 @@ def extract_slide_text(pptx_path: str) -> List[Dict]:
 
 
 def generate_questions(slide_text: List[Dict], n_questions: int = 8) -> List[Dict]:
-    """
-    Offline question generator.
-    Produces short-answer questions anchored to slide numbers.
-    """
     candidates = []
     for s in slide_text:
         if s["title"]:
@@ -120,7 +111,6 @@ def generate_questions(slide_text: List[Dict], n_questions: int = 8) -> List[Dic
                     "context": s["full_text"],
                 }
             )
-        # Use up to 3 bullets per slide
         for b in s["bullets"][:3]:
             candidates.append(
                 {
@@ -130,7 +120,7 @@ def generate_questions(slide_text: List[Dict], n_questions: int = 8) -> List[Dic
                 }
             )
 
-    # Deduplicate by question text
+    # Deduplicate
     seen = set()
     uniq = []
     for c in candidates:
@@ -142,13 +132,9 @@ def generate_questions(slide_text: List[Dict], n_questions: int = 8) -> List[Dic
 
 
 def score_answers(qa_items: List[Dict]) -> Dict:
-    """
-    TF-IDF similarity between answer and slide context.
-    Returns a 0–100 score per question plus overall.
-    """
     vec = TfidfVectorizer(stop_words="english")
-
     scored = []
+
     for item in qa_items:
         context = (item.get("context") or "").strip()
         answer = (item.get("answer") or "").strip()
@@ -156,7 +142,6 @@ def score_answers(qa_items: List[Dict]) -> Dict:
         if not answer:
             scored.append({**item, "score": 0.0, "reason": "No answer provided."})
             continue
-
         if not context:
             scored.append({**item, "score": 0.0, "reason": "No slide context available."})
             continue
@@ -177,45 +162,26 @@ def score_answers(qa_items: List[Dict]) -> Dict:
     return {"overall": overall, "items": scored}
 
 
-def stamp_image(img: Image.Image, stamp_text: str) -> Image.Image:
-    img = img.convert("RGB")
-    w, h = img.size
-    bar_h = max(55, h // 12)
+def get_video_duration_seconds(video_path: str) -> float:
+    """
+    Cloud-safe duration check using OpenCV.
+    Works for most MP4/WebM. If metadata is missing, returns -1.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return -1.0
 
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([(0, h - bar_h), (w, h)], fill=(0, 0, 0))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    cap.release()
 
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", size=max(16, bar_h // 2))
-    except Exception:
-        font = ImageFont.load_default()
-
-    draw.text((12, h - bar_h + 10), stamp_text, fill=(255, 255, 255), font=font)
-    return img
-
-
-def save_snapshot(camera_file, snapshots_dir: str, session_id: str, slide_no: int, label: str) -> str:
-    os.makedirs(snapshots_dir, exist_ok=True)
-    img = Image.open(camera_file)
-    ts = int(time.time())
-    stamp = f"Session: {session_id} | Slide: {slide_no} | {time.strftime('%Y-%m-%d %H:%M:%S')} | {label}"
-    out = stamp_image(img, stamp)
-    out_path = os.path.join(snapshots_dir, f"snap_{ts}_slide{slide_no:03d}.jpg")
-    out.save(out_path, quality=92)
-    return out_path
-
-
-def reset_everything(paths: Dict[str, str]):
-    if os.path.exists(paths["root"]):
-        shutil.rmtree(paths["root"], ignore_errors=True)
-    keep = {"session_id"}
-    for k in list(st.session_state.keys()):
-        if k not in keep:
-            del st.session_state[k]
+    if fps and fps > 0 and frame_count and frame_count > 0:
+        return float(frame_count / fps)
+    return -1.0
 
 
 # =========================
-# Session state init
+# UI State
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -224,17 +190,13 @@ session_id = ensure_session_id()
 paths = session_paths(session_id)
 init_dirs(paths)
 
-st.session_state.setdefault("phase", "upload")  # upload -> present -> qa -> results
+st.session_state.setdefault("phase", "upload")  # upload -> review -> qa -> results
 st.session_state.setdefault("pptx_path", None)
+st.session_state.setdefault("video_path", None)
 st.session_state.setdefault("slide_text", [])
 st.session_state.setdefault("questions", [])
 st.session_state.setdefault("slide_index", 0)
-
-st.session_state.setdefault("present_start", None)
 st.session_state.setdefault("qa_start", None)
-
-st.session_state.setdefault("snapshot_log", [])
-st.session_state.setdefault("snapshot_taken_for_slide", False)
 
 
 # =========================
@@ -244,181 +206,155 @@ with st.sidebar:
     st.subheader("Session")
     st.write(f"Session ID: `{session_id}`")
     st.write(f"Phase: **{st.session_state.phase}**")
-
     st.write("---")
-    st.write("Limits")
-    st.write("- Presentation: 10 minutes")
-    st.write("- Q&A: 5 minutes")
-
+    st.write("Rules")
+    st.write("- Video presentation ≤ 10 minutes")
+    st.write("- Q&A ≤ 5 minutes")
     st.write("---")
-    if st.button("Reset session (delete files)"):
-        reset_everything(paths)
+    if st.button("Reset session"):
+        # delete files + reset state
+        try:
+            import shutil
+            shutil.rmtree(paths["root"], ignore_errors=True)
+        except Exception:
+            pass
+        keep = {"session_id"}
+        for k in list(st.session_state.keys()):
+            if k not in keep:
+                del st.session_state[k]
         st.rerun()
 
 
 # =========================
-# Phase: Upload
+# Phase 1: Upload
 # =========================
 if st.session_state.phase == "upload":
-    st.markdown("## 1) Upload PowerPoint (.pptx)")
-    uploaded = st.file_uploader("Upload PPTX", type=["pptx"])
+    st.markdown("## 1) Upload PPTX and your presentation video")
 
-    st.info(
-        "This Cloud-safe version shows slides as text (title + bullets). "
-        "It still enforces time limits and collects stamped camera evidence per slide."
-    )
+    col1, col2 = st.columns(2)
 
-    if uploaded is not None:
-        pptx_name = safe_filename(uploaded.name)
+    with col1:
+        pptx_file = st.file_uploader("Upload PPTX (.pptx)", type=["pptx"])
+
+    with col2:
+        video_file = st.file_uploader("Upload presentation video (mp4, webm, mov)", type=["mp4", "webm", "mov", "m4v"])
+
+    if pptx_file is not None:
+        pptx_name = safe_filename(pptx_file.name)
         pptx_path = os.path.join(paths["uploads"], pptx_name)
         with open(pptx_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-
+            f.write(pptx_file.getbuffer())
         st.session_state.pptx_path = pptx_path
 
-        with st.status("Reading PPTX...", expanded=True) as status:
-            st.write("Extracting slide text...")
-            slide_text = extract_slide_text(pptx_path)
-            st.session_state.slide_text = slide_text
+        slide_text = extract_slide_text(pptx_path)
+        st.session_state.slide_text = slide_text
+        st.session_state.questions = generate_questions(slide_text, n_questions=8)
 
-            st.write("Generating questions...")
-            st.session_state.questions = generate_questions(slide_text, n_questions=8)
+        with open(os.path.join(paths["meta"], "slides_text.json"), "w", encoding="utf-8") as f:
+            json.dump(slide_text, f, indent=2, ensure_ascii=False)
 
-            # save meta
-            os.makedirs(paths["meta"], exist_ok=True)
-            with open(os.path.join(paths["meta"], "slides_text.json"), "w", encoding="utf-8") as f:
-                json.dump(slide_text, f, indent=2, ensure_ascii=False)
+        st.success("PPTX processed.")
 
-            status.update(label="Ready", state="complete")
+    if video_file is not None:
+        vid_name = safe_filename(video_file.name)
+        vid_path = os.path.join(paths["uploads"], vid_name)
+        with open(vid_path, "wb") as f:
+            f.write(video_file.getbuffer())
+        st.session_state.video_path = vid_path
 
-        if st.button("Start presentation"):
-            st.session_state.phase = "present"
-            st.session_state.present_start = time.time()
+        dur = get_video_duration_seconds(vid_path)
+        if dur < 0:
+            st.warning("Could not read video duration reliably. Try MP4 or WebM.")
+        else:
+            st.info(f"Detected video duration: {dur:.1f} seconds ({dur/60:.2f} minutes)")
+
+            if dur > MAX_VIDEO_SECONDS:
+                st.error("Video is longer than 10 minutes. Please upload a video that is 10 minutes or less.")
+                st.session_state.video_path = None
+
+    ready = (st.session_state.pptx_path is not None) and (st.session_state.video_path is not None)
+
+    if ready:
+        if st.button("Continue to review"):
+            st.session_state.phase = "review"
             st.session_state.slide_index = 0
-            st.session_state.snapshot_taken_for_slide = False
             st.rerun()
+    else:
+        st.info("Upload BOTH the PPTX and the video to continue.")
 
 
 # =========================
-# Phase: Present
+# Phase 2: Review (Slides + Video)
 # =========================
-elif st.session_state.phase == "present":
+elif st.session_state.phase == "review":
     slides = st.session_state.slide_text
-    if not slides:
-        st.error("No slides loaded. Go back and upload again.")
+    video_path = st.session_state.video_path
+
+    if not slides or not video_path:
+        st.error("Missing PPTX or video. Reset and upload again.")
         st.stop()
 
-    elapsed = int(time.time() - (st.session_state.present_start or time.time()))
-    remaining = MAX_PRESENTATION_SECONDS - elapsed
+    st.markdown("## 2) Review slides and video")
 
-    st.markdown("## 2) Presentation (max 10 minutes)")
-    left, right = st.columns([1, 2])
+    left, right = st.columns([1, 1])
+
+    # Slides (text slideshow)
     with left:
-        st.metric("Time remaining", f"{max(0, remaining)//60:02d}:{max(0, remaining)%60:02d}")
-    with right:
-        st.write("Rule: take at least one snapshot per slide before moving forward.")
-        st.write("Snapshots are stamped with session id, slide number, timestamp.")
+        idx = st.session_state.slide_index
+        slide = slides[idx]
+        total = len(slides)
 
-    # hard stop
-    if remaining <= 0:
-        st.warning("Time is up. Moving to Q&A.")
+        st.markdown(f"### Slide {slide['slide']} / {total}")
+        st.markdown(f"**{slide['title'] or '(No title detected)'}**")
+
+        if slide["bullets"]:
+            for b in slide["bullets"]:
+                st.write(f"- {b}")
+        else:
+            st.write("(No bullet text found on this slide.)")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Prev slide"):
+                st.session_state.slide_index = max(0, idx - 1)
+                st.rerun()
+        with c2:
+            if st.button("Next slide"):
+                st.session_state.slide_index = min(total - 1, idx + 1)
+                st.rerun()
+
+    # Video
+    with right:
+        st.markdown("### Presentation video")
+        with open(video_path, "rb") as f:
+            st.video(f.read())
+
+        st.caption("If the video doesn’t play, re-upload as MP4 (H.264) or WebM.")
+
+    st.write("---")
+    if st.button("Start Q&A (5 minutes)"):
         st.session_state.phase = "qa"
         st.session_state.qa_start = time.time()
         st.rerun()
 
-    # current slide
-    idx = st.session_state.slide_index
-    slide = slides[idx]
-    slide_no = slide["slide"]
-    total = len(slides)
-
-    # Show slide content
-    st.markdown(f"### Slide {slide_no} / {total}")
-    if slide["title"]:
-        st.markdown(f"**{slide['title']}**")
-    else:
-        st.markdown("**(No title detected)**")
-
-    if slide["bullets"]:
-        for b in slide["bullets"]:
-            st.write(f"- {b}")
-    else:
-        st.write("(No bullet text found on this slide.)")
-
-    st.write("---")
-
-    # Camera capture
-    st.markdown("### Camera snapshot (required)")
-    shot = st.camera_input("Take snapshot for this slide")
-
-    if shot is not None:
-        saved = save_snapshot(
-            shot,
-            snapshots_dir=paths["snapshots"],
-            session_id=session_id,
-            slide_no=slide_no,
-            label="SlideEvidence",
-        )
-        st.session_state.snapshot_log.append(
-            {
-                "slide": slide_no,
-                "path": saved,
-                "timestamp": int(time.time()),
-            }
-        )
-        st.session_state.snapshot_taken_for_slide = True
-        st.success("Snapshot saved and stamped.")
-
-    # Navigation
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 2])
-
-    with c1:
-        if st.button("Prev"):
-            st.session_state.slide_index = max(0, idx - 1)
-            st.session_state.snapshot_taken_for_slide = False
-            st.rerun()
-
-    with c2:
-        if st.button("Next"):
-            if not st.session_state.snapshot_taken_for_slide:
-                st.error("Take a snapshot before moving to the next slide.")
-            else:
-                st.session_state.slide_index = min(total - 1, idx + 1)
-                st.session_state.snapshot_taken_for_slide = False
-                st.rerun()
-
-    with c3:
-        if st.button("Finish early"):
-            st.session_state.phase = "qa"
-            st.session_state.qa_start = time.time()
-            st.rerun()
-
-    with c4:
-        st.caption("Tip: If camera doesn’t open, allow browser camera permissions and refresh.")
-
-    with st.expander("Snapshot log"):
-        for it in st.session_state.snapshot_log[-15:]:
-            st.write(f"- Slide {it['slide']} | {time.strftime('%H:%M:%S', time.localtime(it['timestamp']))} | {os.path.basename(it['path'])}")
-
 
 # =========================
-# Phase: Q&A
+# Phase 3: Q&A (Timed)
 # =========================
 elif st.session_state.phase == "qa":
-    st.markdown("## 3) Auto Questions (answer within 5 minutes)")
+    st.markdown("## 3) Auto Questions (Answer within 5 minutes)")
 
-    elapsed = int(time.time() - (st.session_state.qa_start or time.time()))
+    if st.session_state.qa_start is None:
+        st.session_state.qa_start = time.time()
+
+    elapsed = int(time.time() - st.session_state.qa_start)
     remaining = MAX_QA_SECONDS - elapsed
-    st.metric("Time remaining", f"{max(0, remaining)//60:02d}:{max(0, remaining)%60:02d}")
 
-    if remaining <= 0:
-        st.warning("Q&A time is up. Submitting answers.")
-        st.session_state.phase = "results"
-        st.rerun()
+    st.metric("Time remaining", f"{max(0, remaining)//60:02d}:{max(0, remaining)%60:02d}")
 
     questions = st.session_state.questions or []
     if not questions:
-        st.error("No questions generated.")
+        st.error("No questions generated from slides.")
         st.stop()
 
     answers_payload = []
@@ -431,67 +367,50 @@ elif st.session_state.phase == "qa":
     with open(os.path.join(paths["answers"], "qa_answers.json"), "w", encoding="utf-8") as f:
         json.dump(answers_payload, f, indent=2, ensure_ascii=False)
 
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        if st.button("Submit now"):
-            st.session_state.phase = "results"
-            st.rerun()
-    with c2:
-        st.info("Auto-submit happens at 5 minutes even if you don’t click submit.")
+    if remaining <= 0:
+        st.warning("Time is up. Submitting answers.")
+        st.session_state.phase = "results"
+        st.rerun()
+
+    if st.button("Submit now"):
+        st.session_state.phase = "results"
+        st.rerun()
 
 
 # =========================
-# Phase: Results
+# Phase 4: Results
 # =========================
 elif st.session_state.phase == "results":
-    st.markdown("## 4) Results (Auto-scoring + Evidence)")
+    st.markdown("## 4) Results and Auto-Scoring")
 
     ans_path = os.path.join(paths["answers"], "qa_answers.json")
     if not os.path.exists(ans_path):
-        st.error("Answers file not found.")
+        st.error("Answers not found.")
         st.stop()
 
     with open(ans_path, "r", encoding="utf-8") as f:
         qa_items = json.load(f)
 
     scoring = score_answers(qa_items)
+
     st.metric("Overall alignment score", f"{scoring['overall']:.1f} / 100")
 
-    st.write("---")
     for i, item in enumerate(scoring["items"], start=1):
         st.markdown(f"### Q{i} (Slide {item.get('slide')})")
         st.write(item.get("question", ""))
-        st.write("**Answer**")
+        st.write("**Answer:**")
         st.write(item.get("answer", ""))
-
         st.write(f"**Score:** {item['score']:.1f} / 100")
-        st.caption(item.get("reason", ""))
-
         with st.expander("Slide context used for marking"):
             st.write(item.get("context", ""))
 
-    st.write("---")
-    st.markdown("### Evidence snapshots")
+    st.success("Done. Files saved in the session folder.")
 
-    snaps = st.session_state.snapshot_log
-    st.write(f"Snapshots captured: **{len(snaps)}**")
-
-    if snaps:
-        show_n = min(12, len(snaps))
-        for it in snaps[-show_n:]:
-            try:
-                st.image(
-                    it["path"],
-                    caption=f"Slide {it['slide']} | {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(it['timestamp']))}",
-                    width=420,
-                )
-            except Exception:
-                st.write(it["path"])
-
-    st.success("Completed. Admin can review session files from the server storage.")
-
-    if st.button("Start new session"):
-        reset_everything(paths)
-        # keep same session_id but reset app state fresh
+    if st.button("New session"):
+        # soft reset
+        keep = {"session_id"}
+        for k in list(st.session_state.keys()):
+            if k not in keep:
+                del st.session_state[k]
         st.session_state.session_id = uuid.uuid4().hex
         st.rerun()
