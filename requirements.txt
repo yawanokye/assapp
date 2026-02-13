@@ -1,9 +1,5 @@
 streamlit==1.32.2
 python-pptx==0.6.23
 Pillow==10.2.0
-streamlit-webrtc==0.47.7
 numpy==1.26.4
 scikit-learn==1.4.2
-opencv-python-headless==4.9.0.80
-
-
